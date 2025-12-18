@@ -34,7 +34,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Get WordPress apache tags from Docker Hub (6.7.0+)
+    - name: Get WordPress apache tag groups from Docker Hub (6.7.0+)
       id: get-tags
       run: |
         set -euo pipefail
@@ -62,7 +62,7 @@ jobs:
             version="${BASH_REMATCH[1]}"
           elif [[ "$tag" =~ ^([0-9]+\.[0-9]+) ]]; then
             version="${BASH_REMATCH[1]}.0"
-          elif [[ "$tag" =~ ^([0-9]+)- ]]; then
+          elif [[ "$tag" =~ ^([0-9]+)- ]] || [[ "$tag" =~ ^([0-9]+)$ ]]; then
             version="${BASH_REMATCH[1]}.0.0"
           fi
 
@@ -78,230 +78,206 @@ jobs:
 
         if [ -z "$ALL_TAGS" ]; then
           echo "Warning: No tags found from API"
-          echo "apache-tags=" >> $GITHUB_OUTPUT
-          echo "source-tags=" >> $GITHUB_OUTPUT
-          echo "tags-matrix=[]" >> $GITHUB_OUTPUT
+          echo "tag-groups=" >> $GITHUB_OUTPUT
           exit 0
         fi
 
         echo "Total tags found: $(echo "$ALL_TAGS" | wc -l)"
 
-        # Filter for apache tags and version >= 6.7.0
-        echo "Filtering for apache tags >= ${{ env.MIN_VERSION }}..."
-        FILTERED_TAGS=""
-        declare -A TAG_MAPPING  # Maps destination tag to source tag
-        declare -A PROCESSED_SOURCES  # Tracks which source tags we've seen
+        # Define tag groups based on WordPress upstream structure
+        # Each group represents tags that should point to the same image
+        declare -A TAG_GROUPS
+        declare -A PROCESSED_TAGS
 
+        # Process all tags and group them
         while IFS= read -r tag; do
           [ -z "$tag" ] && continue
+          [[ "${PROCESSED_TAGS[$tag]:-}" == "1" ]] && continue
 
-          # Check if tag contains "apache" and matches our patterns
+          # Only process apache tags for version 6+
           if [[ "$tag" == *"apache"* ]]; then
-            echo "Processing apache tag: $tag"
+            VERSION=$(extract_version "$tag")
 
-            # Check if it's a version 6+ apache tag
-            if [[ "$tag" =~ ^6- ]] || [[ "$tag" =~ ^6\. ]]; then
-              echo "  ✓ Version 6+ apache tag: $tag"
+            # Skip if version is less than minimum
+            if [ -n "$VERSION" ] && ! version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
+              echo "Skipping $tag (version $VERSION < ${{ env.MIN_VERSION }})"
+              continue
+            fi
 
-              # Determine the "canonical" source tag (most specific version)
-              SOURCE_TAG=""
-              if [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+-.*apache ]]; then
-                # This is already a specific version tag
-                SOURCE_TAG="$tag"
-              else
-                # This is a shorter alias, find the corresponding full version
-                # For now, we'll use the tag as-is and Docker will resolve it
-                SOURCE_TAG="$tag"
-              fi
+            # Determine the canonical source tag (most specific version)
+            SOURCE_TAG=""
+            GROUP_TAGS=""
 
-              VERSION=$(extract_version "$tag")
-              if [ -n "$VERSION" ] && version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
-                echo "  ✓ Version check passed: $VERSION >= ${{ env.MIN_VERSION }}"
+            # For PHP 8.3 apache (default) - these all share the same image
+            if [[ "$tag" =~ ^6\.9\.0-apache$ ]] || [[ "$tag" =~ ^6\.9-apache$ ]] || [[ "$tag" =~ ^6-apache$ ]] || [[ "$tag" == "apache" ]] || \
+               [[ "$tag" =~ ^6\.9\.0$ ]] || [[ "$tag" =~ ^6\.9$ ]] || [[ "$tag" == "6" ]] || [[ "$tag" == "latest" ]] || \
+               [[ "$tag" =~ ^6\.9\.0-php8\.3-apache$ ]] || [[ "$tag" =~ ^6\.9-php8\.3-apache$ ]] || [[ "$tag" =~ ^6-php8\.3-apache$ ]] || [[ "$tag" == "php8.3-apache" ]] || \
+               [[ "$tag" =~ ^6\.9\.0-php8\.3$ ]] || [[ "$tag" =~ ^6\.9-php8\.3$ ]] || [[ "$tag" =~ ^6-php8\.3$ ]] || [[ "$tag" == "php8.3" ]]; then
 
-                if [ -z "$FILTERED_TAGS" ]; then
-                  FILTERED_TAGS="$tag"
-                else
-                  FILTERED_TAGS="$FILTERED_TAGS"$'\n'"$tag"
+              SOURCE_TAG="6.9.0-php8.3-apache"  # Use the most specific tag as source
+              GROUP_KEY="php8.3-apache"
+
+              # Find all related tags for this group
+              for related_tag in "6.9.0-apache" "6.9-apache" "6-apache" "apache" "6.9.0" "6.9" "6" "latest" \
+                                "6.9.0-php8.3-apache" "6.9-php8.3-apache" "6-php8.3-apache" "php8.3-apache" \
+                                "6.9.0-php8.3" "6.9-php8.3" "6-php8.3" "php8.3"; do
+                if echo "$ALL_TAGS" | grep -q "^${related_tag}$"; then
+                  if [ -z "$GROUP_TAGS" ]; then
+                    GROUP_TAGS="$related_tag"
+                  else
+                    GROUP_TAGS="$GROUP_TAGS,$related_tag"
+                  fi
+                  PROCESSED_TAGS["$related_tag"]="1"
                 fi
+              done
 
-                TAG_MAPPING["$tag"]="$SOURCE_TAG"
-                PROCESSED_SOURCES["$SOURCE_TAG"]=1
-              else
-                echo "  ✗ Version check failed: $VERSION < ${{ env.MIN_VERSION }}"
+            # For other PHP versions with apache
+            elif [[ "$tag" =~ ^6\.9\.0-php([0-9]+\.[0-9]+)-apache$ ]] || [[ "$tag" =~ ^6\.9-php([0-9]+\.[0-9]+)-apache$ ]] || \
+                 [[ "$tag" =~ ^6-php([0-9]+\.[0-9]+)-apache$ ]] || [[ "$tag" =~ ^php([0-9]+\.[0-9]+)-apache$ ]] || \
+                 [[ "$tag" =~ ^6\.9\.0-php([0-9]+\.[0-9]+)$ ]] || [[ "$tag" =~ ^6\.9-php([0-9]+\.[0-9]+)$ ]] || \
+                 [[ "$tag" =~ ^6-php([0-9]+\.[0-9]+)$ ]] || [[ "$tag" =~ ^php([0-9]+\.[0-9]+)$ ]]; then
+
+              # Extract PHP version
+              PHP_VERSION=""
+              if [[ "$tag" =~ php([0-9]+\.[0-9]+) ]]; then
+                PHP_VERSION="${BASH_REMATCH[1]}"
               fi
-            elif [[ "$tag" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?.*apache ]]; then
-              # Specific version apache tag
-              VERSION=$(extract_version "$tag")
-              if [ -n "$VERSION" ] && version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
-                echo "  ✓ Including specific version tag: $tag (version: $VERSION)"
 
-                if [ -z "$FILTERED_TAGS" ]; then
-                  FILTERED_TAGS="$tag"
-                else
-                  FILTERED_TAGS="$FILTERED_TAGS"$'\n'"$tag"
-                fi
+              if [ -n "$PHP_VERSION" ]; then
+                SOURCE_TAG="6.9.0-php${PHP_VERSION}-apache"
+                GROUP_KEY="php${PHP_VERSION}-apache"
 
-                TAG_MAPPING["$tag"]="$tag"
-                PROCESSED_SOURCES["$tag"]=1
-              else
-                echo "  ✗ Skipping tag: $tag (version: $VERSION < ${{ env.MIN_VERSION }})"
+                # Find all related tags for this PHP version
+                for related_tag in "6.9.0-php${PHP_VERSION}-apache" "6.9-php${PHP_VERSION}-apache" "6-php${PHP_VERSION}-apache" "php${PHP_VERSION}-apache" \
+                                  "6.9.0-php${PHP_VERSION}" "6.9-php${PHP_VERSION}" "6-php${PHP_VERSION}" "php${PHP_VERSION}"; do
+                  if echo "$ALL_TAGS" | grep -q "^${related_tag}$"; then
+                    if [ -z "$GROUP_TAGS" ]; then
+                      GROUP_TAGS="$related_tag"
+                    else
+                      GROUP_TAGS="$GROUP_TAGS,$related_tag"
+                    fi
+                    PROCESSED_TAGS["$related_tag"]="1"
+                  fi
+                done
               fi
-            else
-              echo "  ? Skipping non-version-6+ apache tag: $tag"
+            fi
+
+            # Add the group if we found tags
+            if [ -n "$SOURCE_TAG" ] && [ -n "$GROUP_TAGS" ]; then
+              TAG_GROUPS["$GROUP_KEY"]="$SOURCE_TAG|$GROUP_TAGS"
+              echo "Created group $GROUP_KEY: $SOURCE_TAG -> $GROUP_TAGS"
             fi
           fi
         done <<< "$ALL_TAGS"
 
-        echo "Final filtered apache tags:"
-        echo "$FILTERED_TAGS"
+        # Convert tag groups to JSON for output
+        TAG_GROUPS_JSON="{"
+        FIRST=true
+        for group_key in "${!TAG_GROUPS[@]}"; do
+          IFS='|' read -r source_tag group_tags <<< "${TAG_GROUPS[$group_key]}"
 
-        # Create mapping output for build step
-        TAG_MAP_JSON="{"
-        for dest_tag in $(echo "$FILTERED_TAGS" | tr '\n' ' '); do
-          if [ -n "$dest_tag" ]; then
-            source_tag="${TAG_MAPPING[$dest_tag]}"
-            if [ -n "$TAG_MAP_JSON" ] && [ "$TAG_MAP_JSON" != "{" ]; then
-              TAG_MAP_JSON="$TAG_MAP_JSON,"
-            fi
-            TAG_MAP_JSON="$TAG_MAP_JSON\"$dest_tag\":\"$source_tag\""
+          if [ "$FIRST" = true ]; then
+            FIRST=false
+          else
+            TAG_GROUPS_JSON="$TAG_GROUPS_JSON,"
           fi
+
+          TAG_GROUPS_JSON="$TAG_GROUPS_JSON\"$group_key\":{\"source\":\"$source_tag\",\"tags\":\"$group_tags\"}"
         done
-        TAG_MAP_JSON="$TAG_MAP_JSON}"
+        TAG_GROUPS_JSON="$TAG_GROUPS_JSON}"
 
-        echo "Tag mapping: $TAG_MAP_JSON"
-
-        # Convert to JSON array
-        if [ -n "$FILTERED_TAGS" ]; then
-          TAGS_ARRAY=$(echo "$FILTERED_TAGS" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null || echo '[]')
-        else
-          TAGS_ARRAY="[]"
-        fi
-
-        echo "tags-matrix=$TAGS_ARRAY" >> $GITHUB_OUTPUT
-        echo "tag-mapping=$TAG_MAP_JSON" >> $GITHUB_OUTPUT
-
-        {
-          echo "apache-tags<<EOF"
-          echo "$FILTERED_TAGS"
-          echo "EOF"
-        } >> $GITHUB_OUTPUT
+        echo "Tag groups JSON: $TAG_GROUPS_JSON"
+        echo "tag-groups=$TAG_GROUPS_JSON" >> $GITHUB_OUTPUT
 
     - name: Check existing tags in GHCR
       id: check-existing
-      if: steps.get-tags.outputs.apache-tags != ''
+      if: steps.get-tags.outputs.tag-groups != ''
       run: |
         set -euo pipefail
 
         echo "Checking existing tags in GHCR..."
-        NEW_TAGS=""
+        TAG_GROUPS='${{ steps.get-tags.outputs.tag-groups }}'
+        NEW_GROUPS=""
 
-        while IFS= read -r tag; do
-          if [ -n "$tag" ]; then
-            if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag >/dev/null 2>&1; then
-              echo "Tag $tag already exists in GHCR"
-            else
-              echo "Tag $tag is new, will build"
-              if [ -z "$NEW_TAGS" ]; then
-                NEW_TAGS="$tag"
-              else
-                NEW_TAGS="$NEW_TAGS,$tag"
-              fi
+        # Check each group
+        for group_key in $(echo "$TAG_GROUPS" | jq -r 'keys[]'); do
+          group_tags=$(echo "$TAG_GROUPS" | jq -r ".[\"$group_key\"].tags")
+
+          # Check if any tag in the group is missing
+          GROUP_NEEDS_BUILD=false
+          IFS=',' read -ra TAGS_ARRAY <<< "$group_tags"
+
+          for tag in "${TAGS_ARRAY[@]}"; do
+            if ! docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag >/dev/null 2>&1; then
+              echo "Tag $tag is missing, group $group_key needs build"
+              GROUP_NEEDS_BUILD=true
+              break
             fi
-          fi
-        done <<< "${{ steps.get-tags.outputs.apache-tags }}"
+          done
 
-        echo "new-tags=$NEW_TAGS" >> $GITHUB_OUTPUT
-        echo "New tags to build: $NEW_TAGS"
-
-    - name: Build and push images with caching and deduplication
-      if: steps.check-existing.outputs.new-tags != ''
-      run: |
-        set -euo pipefail
-
-        # Parse tag mapping
-        TAG_MAPPING='${{ steps.get-tags.outputs.tag-mapping }}'
-        echo "Tag mapping: $TAG_MAPPING"
-
-        IFS=',' read -ra TAGS_ARRAY <<< "${{ steps.check-existing.outputs.new-tags }}"
-
-        declare -A BUILT_IMAGES  # Track which source images we've built
-
-        for dest_tag in "${TAGS_ARRAY[@]}"; do
-          if [ -n "$dest_tag" ]; then
-            # Get source tag from mapping
-            source_tag=$(echo "$TAG_MAPPING" | jq -r ".[\"$dest_tag\"]" 2>/dev/null || echo "$dest_tag")
-
-            echo "Processing destination tag: $dest_tag (source: $source_tag)"
-
-            # Check if we've already built this source image
-            if [ -n "${BUILT_IMAGES[$source_tag]:-}" ]; then
-              echo "Reusing existing image for $source_tag, just tagging as $dest_tag"
-
-              # Tag the existing image
-              docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$source_tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
-              docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
+          if [ "$GROUP_NEEDS_BUILD" = true ]; then
+            if [ -z "$NEW_GROUPS" ]; then
+              NEW_GROUPS="$group_key"
             else
-              echo "Building new image for source tag: $source_tag"
-
-              # Create Dockerfile from template
-              sed "s/{{TAG}}/$source_tag/g" Dockerfile.template > Dockerfile.build
-
-              echo "Generated Dockerfile:"
-              cat Dockerfile.build
-
-              # Create cache key based on source tag
-              CACHE_KEY="wordpress-$source_tag"
-
-              # Build and push the image with GitHub Actions cache
-              docker buildx build \
-                --platform linux/amd64,linux/arm64 \
-                --file Dockerfile.build \
-                --cache-from type=gha,scope=$CACHE_KEY \
-                --cache-to type=gha,mode=max,scope=$CACHE_KEY \
-                --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$source_tag \
-                --push \
-                .
-
-              # Mark this source as built
-              BUILT_IMAGES[$source_tag]=1
-
-              # If destination tag is different from source, tag and push it too
-              if [ "$dest_tag" != "$source_tag" ]; then
-                echo "Tagging $source_tag as $dest_tag"
-                docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$source_tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
-                docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
-              fi
-
-              # Clean up
-              rm Dockerfile.build
+              NEW_GROUPS="$NEW_GROUPS,$group_key"
             fi
-
-            echo "Successfully processed $dest_tag"
+          else
+            echo "All tags for group $group_key exist"
           fi
         done
 
-    - name: Update latest tag
-      if: steps.check-existing.outputs.new-tags != ''
+        echo "new-groups=$NEW_GROUPS" >> $GITHUB_OUTPUT
+        echo "Groups to build: $NEW_GROUPS"
+
+    - name: Build and push image groups with caching
+      if: steps.check-existing.outputs.new-groups != ''
       run: |
         set -euo pipefail
 
-        # Find the most recent version tag for latest
-        LATEST_TAG=$(echo "${{ steps.get-tags.outputs.apache-tags }}" | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?.*apache' | sort -V | tail -1 || echo "")
+        TAG_GROUPS='${{ steps.get-tags.outputs.tag-groups }}'
+        IFS=',' read -ra GROUPS_ARRAY <<< "${{ steps.check-existing.outputs.new-groups }}"
 
-        # If no specific version found, try to find 6-apache
-        if [ -z "$LATEST_TAG" ]; then
-          LATEST_TAG=$(echo "${{ steps.get-tags.outputs.apache-tags }}" | grep '^6-apache$' || echo "")
-        fi
+        for group_key in "${GROUPS_ARRAY[@]}"; do
+          if [ -n "$group_key" ]; then
+            source_tag=$(echo "$TAG_GROUPS" | jq -r ".[\"$group_key\"].source")
+            group_tags=$(echo "$TAG_GROUPS" | jq -r ".[\"$group_key\"].tags")
 
-        if [ -n "$LATEST_TAG" ]; then
-          echo "Tagging $LATEST_TAG as latest"
+            echo "Building group: $group_key"
+            echo "Source tag: $source_tag"
+            echo "Target tags: $group_tags"
 
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$LATEST_TAG
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$LATEST_TAG ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-        else
-          echo "No suitable tag found for latest"
-        fi
+            # Create Dockerfile from template
+            sed "s/{{TAG}}/$source_tag/g" Dockerfile.template > Dockerfile.build
+
+            echo "Generated Dockerfile:"
+            cat Dockerfile.build
+
+            # Prepare all tags for the build
+            BUILD_TAGS=""
+            IFS=',' read -ra TAGS_ARRAY <<< "$group_tags"
+            for tag in "${TAGS_ARRAY[@]}"; do
+              BUILD_TAGS="$BUILD_TAGS --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag"
+            done
+
+            # Create cache key based on source tag
+            CACHE_KEY="wordpress-apache-$source_tag"
+
+            # Build and push the image with all tags and GitHub Actions cache
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --file Dockerfile.build \
+              --cache-from type=gha,scope=$CACHE_KEY \
+              --cache-to type=gha,mode=max,scope=$CACHE_KEY \
+              $BUILD_TAGS \
+              --push \
+              .
+
+            # Clean up
+            rm Dockerfile.build
+
+            echo "Successfully built and pushed group $group_key with tags: $group_tags"
+          fi
+        done
 
     - name: Summary
       run: |
@@ -311,21 +287,15 @@ jobs:
         echo "- **Minimum Version**: ${{ env.MIN_VERSION }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Caching**: GitHub Actions cache enabled with buildx" >> $GITHUB_STEP_SUMMARY
 
-        NEW_TAGS="${{ steps.check-existing.outputs.new-tags || '' }}"
-        if [ -n "$NEW_TAGS" ]; then
-          echo "- **New tags built**: $NEW_TAGS" >> $GITHUB_STEP_SUMMARY
+        NEW_GROUPS="${{ steps.check-existing.outputs.new-groups || '' }}"
+        if [ -n "$NEW_GROUPS" ]; then
+          echo "- **New groups built**: $NEW_GROUPS" >> $GITHUB_STEP_SUMMARY
         else
-          echo "- **Result**: No new tags to build" >> $GITHUB_STEP_SUMMARY
+          echo "- **Result**: No new groups to build" >> $GITHUB_STEP_SUMMARY
         fi
 
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Tag Mapping" >> $GITHUB_STEP_SUMMARY
+        echo "### Tag Groups Structure" >> $GITHUB_STEP_SUMMARY
         echo '```json&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
-        echo &#x27;${{ steps.get-tags.outputs.tag-mapping }}&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
-        echo &#x27;```' >> $GITHUB_STEP_SUMMARY
-
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### All available tags (>= ${{ env.MIN_VERSION }}):" >> $GITHUB_STEP_SUMMARY
-        echo '```&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
-        echo &quot;${{ steps.get-tags.outputs.apache-tags }}&quot; &gt;&gt; $GITHUB_STEP_SUMMARY
+        echo &#x27;${{ steps.get-tags.outputs.tag-groups }}&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
         echo &#x27;```' >> $GITHUB_STEP_SUMMARY
