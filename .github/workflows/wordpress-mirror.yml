@@ -1,11 +1,8 @@
 name: WordPress Apache Image Mirror
 
 on:
-  # Run daily at 2 AM UTC to check for updates
   schedule:
     - cron: '0 2 * * *'
-
-  # Allow manual triggering
   workflow_dispatch:
 
 env:
@@ -37,97 +34,103 @@ jobs:
     - name: Get WordPress apache tags from Docker Hub (6.7.0+)
       id: get-tags
       run: |
+        set -euo pipefail
+
         echo "Fetching WordPress apache tags from Docker Hub..."
 
-        # Function to compare versions
-        version_compare() {
-          local version1=$1
-          local version2=$2
+        # Function to compare versions using sort -V
+        version_gte() {
+          local version1="$1"
+          local version2="$2"
 
-          # Use sort -V to compare versions properly
-          if [ "$(printf '%s\n%s' "$version1" "$version2" | sort -V | head -n1)" = "$version1" ]; then
-            if [ "$version1" = "$version2" ]; then
-              return 0  # Equal
-            else
-              return 1  # version1 < version2
-            fi
+          if [ "$(printf '%s\n%s' "$version2" "$version1" | sort -V | head -n1)" = "$version2" ]; then
+            return 0
           else
-            return 2    # version1 > version2
+            return 1
           fi
         }
 
-        # Get all tags from Docker Hub API (fetch multiple pages if needed)
-        ALL_TAGS=""
-        PAGE=1
-        while true; do
-          TAGS_JSON=$(curl -s "https://hub.docker.com/v2/repositories/library/wordpress/tags/?page_size=100&page=$PAGE")
-          PAGE_TAGS=$(echo "$TAGS_JSON" | jq -r '.results[]?.name // empty')
+        # Get tags from Docker Hub API
+        echo "Fetching tags from Docker Hub API..."
+        TAGS_JSON=$(curl -s "https://hub.docker.com/v2/repositories/library/wordpress/tags/?page_size=100" || echo '{"results":[]}')
 
-          if [ -z "$PAGE_TAGS" ]; then
-            break
-          fi
+        # Extract all tag names
+        ALL_TAGS=$(echo "$TAGS_JSON" | jq -r '.results[]?.name // empty' 2>/dev/null || echo "")
 
-          ALL_TAGS="$ALL_TAGS$PAGE_TAGS"$'\n'
-          PAGE=$((PAGE + 1))
+        if [ -z "$ALL_TAGS" ]; then
+          echo "Warning: No tags found from API"
+          echo "apache-tags=" >> $GITHUB_OUTPUT
+          echo "tags-matrix=[]" >> $GITHUB_OUTPUT
+          exit 0
+        fi
 
-          # Limit to reasonable number of pages to avoid infinite loop
-          if [ $PAGE -gt 10 ]; then
-            break
-          fi
-        done
-
-        echo "Processing tags for apache variants >= ${{ env.MIN_VERSION }}..."
+        echo "Total tags found: $(echo "$ALL_TAGS" | wc -l)"
 
         # Filter for apache tags and version >= 6.7.0
+        echo "Filtering for apache tags >= ${{ env.MIN_VERSION }}..."
         FILTERED_TAGS=""
+
         while IFS= read -r tag; do
-          if [[ "$tag" == *"apache"* ]] && [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            # Extract version number (everything before the first hyphen)
-            VERSION=$(echo "$tag" | sed 's/-.*$//')
+          [ -z "$tag" ] && continue
 
-            # Compare with minimum version
-            version_compare "$VERSION" "${{ env.MIN_VERSION }}"
-            RESULT=$?
+          if [[ "$tag" == *"apache"* ]]; then
+            echo "Processing apache tag: $tag"
 
-            if [ $RESULT -eq 0 ] || [ $RESULT -eq 2 ]; then
-              # Version is >= MIN_VERSION
-              if [ -z "$FILTERED_TAGS" ]; then
-                FILTERED_TAGS="$tag"
+            VERSION=""
+            if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+              VERSION="${BASH_REMATCH[1]}"
+            elif [[ "$tag" =~ ^([0-9]+\.[0-9]+) ]]; then
+              VERSION="${BASH_REMATCH[1]}.0"
+            fi
+
+            if [ -n "$VERSION" ]; then
+              echo "  Extracted version: $VERSION"
+
+              if version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
+                echo "  ✓ Including tag: $tag"
+                if [ -z "$FILTERED_TAGS" ]; then
+                  FILTERED_TAGS="$tag"
+                else
+                  FILTERED_TAGS="$FILTERED_TAGS"$'\n'"$tag"
+                fi
               else
-                FILTERED_TAGS="$FILTERED_TAGS"$'\n'"$tag"
+                echo "  ✗ Skipping tag: $tag (< ${{ env.MIN_VERSION }})"
               fi
-              echo "✓ Including tag: $tag (version: $VERSION)"
             else
-              echo "✗ Skipping tag: $tag (version: $VERSION < ${{ env.MIN_VERSION }})"
+              echo "  ? Could not extract version from: $tag"
             fi
           fi
         done <<< "$ALL_TAGS"
 
-        echo "Final filtered apache tags (>= ${{ env.MIN_VERSION }}):"
+        echo "Final filtered apache tags:"
         echo "$FILTERED_TAGS"
 
-        # Convert to JSON array for matrix strategy
+        # Convert to JSON array
         if [ -n "$FILTERED_TAGS" ]; then
-          TAGS_ARRAY=$(echo "$FILTERED_TAGS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          TAGS_ARRAY=$(echo "$FILTERED_TAGS" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null || echo '[]')
         else
           TAGS_ARRAY="[]"
         fi
+
         echo "tags-matrix=$TAGS_ARRAY" >> $GITHUB_OUTPUT
 
-        # Also set a simple list for other steps
-        echo "apache-tags<<EOF" >> $GITHUB_OUTPUT
-        echo "$FILTERED_TAGS" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+        {
+          echo "apache-tags<<EOF"
+          echo "$FILTERED_TAGS"
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
 
     - name: Check existing tags in GHCR
       id: check-existing
+      if: steps.get-tags.outputs.apache-tags != ''
       run: |
+        set -euo pipefail
+
         echo "Checking existing tags in GHCR..."
         NEW_TAGS=""
 
         while IFS= read -r tag; do
           if [ -n "$tag" ]; then
-            # Check if tag exists in GHCR
             if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag >/dev/null 2>&1; then
               echo "Tag $tag already exists in GHCR"
             else
@@ -147,31 +150,30 @@ jobs:
     - name: Build and push images
       if: steps.check-existing.outputs.new-tags != ''
       run: |
+        set -euo pipefail
+
         IFS=',' read -ra TAGS_ARRAY <<< "${{ steps.check-existing.outputs.new-tags }}"
 
         for tag in "${TAGS_ARRAY[@]}"; do
           if [ -n "$tag" ]; then
             echo "Building image for tag: $tag"
 
-            # Create temporary Dockerfile
-            cat > Dockerfile.temp << EOF
-        FROM wordpress:$tag
-        WORKDIR /usr/src/wordpress
-        RUN set -eux; \\
-        	find /etc/apache2 -name '*.conf' -type f -exec sed -ri -e "s!/var/www/html!\$PWD!g" -e "s!Directory /var/www/!Directory \$PWD!g" '{}' +; \\
-        	cp -s wp-config-docker.php wp-config.php
-        EOF
+            # Create Dockerfile from template
+            sed "s/{{TAG}}/$tag/g" Dockerfile.template > Dockerfile.build
+
+            echo "Generated Dockerfile:"
+            cat Dockerfile.build
 
             # Build and push the image
             docker buildx build \
               --platform linux/amd64,linux/arm64 \
-              --file Dockerfile.temp \
+              --file Dockerfile.build \
               --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag \
               --push \
               .
 
             # Clean up
-            rm Dockerfile.temp
+            rm Dockerfile.build
 
             echo "Successfully built and pushed ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag"
           fi
@@ -180,20 +182,18 @@ jobs:
     - name: Update latest tag
       if: steps.check-existing.outputs.new-tags != ''
       run: |
-        # Get the most recent apache tag (using proper version sorting)
-        LATEST_TAG=$(echo "${{ steps.get-tags.outputs.apache-tags }}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-.*apache' | sort -V | tail -1)
+        set -euo pipefail
+
+        LATEST_TAG=$(echo "${{ steps.get-tags.outputs.apache-tags }}" | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?.*apache' | sort -V | tail -1 || echo "")
 
         if [ -n "$LATEST_TAG" ]; then
           echo "Tagging $LATEST_TAG as latest"
 
-          # Pull the image we just built
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$LATEST_TAG
-
-          # Tag as latest
           docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$LATEST_TAG ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-
-          # Push latest tag
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        else
+          echo "No suitable tag found for latest"
         fi
 
     - name: Summary
@@ -203,8 +203,9 @@ jobs:
         echo "- **Image**: ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Minimum Version**: ${{ env.MIN_VERSION }}" >> $GITHUB_STEP_SUMMARY
 
-        if [ -n "${{ steps.check-existing.outputs.new-tags }}" ]; then
-          echo "- **New tags built**: ${{ steps.check-existing.outputs.new-tags }}" >> $GITHUB_STEP_SUMMARY
+        NEW_TAGS="${{ steps.check-existing.outputs.new-tags || '' }}"
+        if [ -n "$NEW_TAGS" ]; then
+          echo "- **New tags built**: $NEW_TAGS" >> $GITHUB_STEP_SUMMARY
         else
           echo "- **Result**: No new tags to build" >> $GITHUB_STEP_SUMMARY
         fi
