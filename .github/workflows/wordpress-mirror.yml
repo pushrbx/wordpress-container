@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: pushrbx/wordpress
+  IMAGE_NAME: pushrbx/wordpress-container
   MIN_VERSION: "6.7.0"
 
 jobs:
