@@ -250,7 +250,7 @@ jobs:
               cat Dockerfile.build
 
               # Create cache key based on source tag
-              CACHE_KEY="wordpress-apache-$source_tag"
+              CACHE_KEY="wordpress-$source_tag"
 
               # Build and push the image with GitHub Actions cache
               docker buildx build \
