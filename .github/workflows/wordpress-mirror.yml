@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/wordpress-apache
+  IMAGE_NAME: wordpress
   MIN_VERSION: "6.7.0"
 
 jobs:
@@ -20,6 +20,9 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -50,6 +53,22 @@ jobs:
           fi
         }
 
+        # Function to extract version from tag
+        extract_version() {
+          local tag="$1"
+          local version=""
+
+          if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            version="${BASH_REMATCH[1]}"
+          elif [[ "$tag" =~ ^([0-9]+\.[0-9]+) ]]; then
+            version="${BASH_REMATCH[1]}.0"
+          elif [[ "$tag" =~ ^([0-9]+)- ]]; then
+            version="${BASH_REMATCH[1]}.0.0"
+          fi
+
+          echo "$version"
+        }
+
         # Get tags from Docker Hub API
         echo "Fetching tags from Docker Hub API..."
         TAGS_JSON=$(curl -s "https://hub.docker.com/v2/repositories/library/wordpress/tags/?page_size=100" || echo '{"results":[]}')
@@ -60,6 +79,7 @@ jobs:
         if [ -z "$ALL_TAGS" ]; then
           echo "Warning: No tags found from API"
           echo "apache-tags=" >> $GITHUB_OUTPUT
+          echo "source-tags=" >> $GITHUB_OUTPUT
           echo "tags-matrix=[]" >> $GITHUB_OUTPUT
           exit 0
         fi
@@ -69,41 +89,86 @@ jobs:
         # Filter for apache tags and version >= 6.7.0
         echo "Filtering for apache tags >= ${{ env.MIN_VERSION }}..."
         FILTERED_TAGS=""
+        declare -A TAG_MAPPING  # Maps destination tag to source tag
+        declare -A PROCESSED_SOURCES  # Tracks which source tags we've seen
 
         while IFS= read -r tag; do
           [ -z "$tag" ] && continue
 
+          # Check if tag contains "apache" and matches our patterns
           if [[ "$tag" == *"apache"* ]]; then
             echo "Processing apache tag: $tag"
 
-            VERSION=""
-            if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION="${BASH_REMATCH[1]}"
-            elif [[ "$tag" =~ ^([0-9]+\.[0-9]+) ]]; then
-              VERSION="${BASH_REMATCH[1]}.0"
-            fi
+            # Check if it's a version 6+ apache tag
+            if [[ "$tag" =~ ^6- ]] || [[ "$tag" =~ ^6\. ]]; then
+              echo "  ✓ Version 6+ apache tag: $tag"
 
-            if [ -n "$VERSION" ]; then
-              echo "  Extracted version: $VERSION"
+              # Determine the "canonical" source tag (most specific version)
+              SOURCE_TAG=""
+              if [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+-.*apache ]]; then
+                # This is already a specific version tag
+                SOURCE_TAG="$tag"
+              else
+                # This is a shorter alias, find the corresponding full version
+                # For now, we'll use the tag as-is and Docker will resolve it
+                SOURCE_TAG="$tag"
+              fi
 
-              if version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
-                echo "  ✓ Including tag: $tag"
+              VERSION=$(extract_version "$tag")
+              if [ -n "$VERSION" ] && version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
+                echo "  ✓ Version check passed: $VERSION >= ${{ env.MIN_VERSION }}"
+
                 if [ -z "$FILTERED_TAGS" ]; then
                   FILTERED_TAGS="$tag"
                 else
                   FILTERED_TAGS="$FILTERED_TAGS"$'\n'"$tag"
                 fi
+
+                TAG_MAPPING["$tag"]="$SOURCE_TAG"
+                PROCESSED_SOURCES["$SOURCE_TAG"]=1
               else
-                echo "  ✗ Skipping tag: $tag (< ${{ env.MIN_VERSION }})"
+                echo "  ✗ Version check failed: $VERSION < ${{ env.MIN_VERSION }}"
+              fi
+            elif [[ "$tag" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?.*apache ]]; then
+              # Specific version apache tag
+              VERSION=$(extract_version "$tag")
+              if [ -n "$VERSION" ] && version_gte "$VERSION" "${{ env.MIN_VERSION }}"; then
+                echo "  ✓ Including specific version tag: $tag (version: $VERSION)"
+
+                if [ -z "$FILTERED_TAGS" ]; then
+                  FILTERED_TAGS="$tag"
+                else
+                  FILTERED_TAGS="$FILTERED_TAGS"$'\n'"$tag"
+                fi
+
+                TAG_MAPPING["$tag"]="$tag"
+                PROCESSED_SOURCES["$tag"]=1
+              else
+                echo "  ✗ Skipping tag: $tag (version: $VERSION < ${{ env.MIN_VERSION }})"
               fi
             else
-              echo "  ? Could not extract version from: $tag"
+              echo "  ? Skipping non-version-6+ apache tag: $tag"
             fi
           fi
         done <<< "$ALL_TAGS"
 
         echo "Final filtered apache tags:"
         echo "$FILTERED_TAGS"
+
+        # Create mapping output for build step
+        TAG_MAP_JSON="{"
+        for dest_tag in $(echo "$FILTERED_TAGS" | tr '\n' ' '); do
+          if [ -n "$dest_tag" ]; then
+            source_tag="${TAG_MAPPING[$dest_tag]}"
+            if [ -n "$TAG_MAP_JSON" ] && [ "$TAG_MAP_JSON" != "{" ]; then
+              TAG_MAP_JSON="$TAG_MAP_JSON,"
+            fi
+            TAG_MAP_JSON="$TAG_MAP_JSON\"$dest_tag\":\"$source_tag\""
+          fi
+        done
+        TAG_MAP_JSON="$TAG_MAP_JSON}"
+
+        echo "Tag mapping: $TAG_MAP_JSON"
 
         # Convert to JSON array
         if [ -n "$FILTERED_TAGS" ]; then
@@ -113,6 +178,7 @@ jobs:
         fi
 
         echo "tags-matrix=$TAGS_ARRAY" >> $GITHUB_OUTPUT
+        echo "tag-mapping=$TAG_MAP_JSON" >> $GITHUB_OUTPUT
 
         {
           echo "apache-tags<<EOF"
@@ -147,35 +213,70 @@ jobs:
         echo "new-tags=$NEW_TAGS" >> $GITHUB_OUTPUT
         echo "New tags to build: $NEW_TAGS"
 
-    - name: Build and push images
+    - name: Build and push images with caching and deduplication
       if: steps.check-existing.outputs.new-tags != ''
       run: |
         set -euo pipefail
 
+        # Parse tag mapping
+        TAG_MAPPING='${{ steps.get-tags.outputs.tag-mapping }}'
+        echo "Tag mapping: $TAG_MAPPING"
+
         IFS=',' read -ra TAGS_ARRAY <<< "${{ steps.check-existing.outputs.new-tags }}"
 
-        for tag in "${TAGS_ARRAY[@]}"; do
-          if [ -n "$tag" ]; then
-            echo "Building image for tag: $tag"
+        declare -A BUILT_IMAGES  # Track which source images we've built
 
-            # Create Dockerfile from template
-            sed "s/{{TAG}}/$tag/g" Dockerfile.template > Dockerfile.build
+        for dest_tag in "${TAGS_ARRAY[@]}"; do
+          if [ -n "$dest_tag" ]; then
+            # Get source tag from mapping
+            source_tag=$(echo "$TAG_MAPPING" | jq -r ".[\"$dest_tag\"]" 2>/dev/null || echo "$dest_tag")
 
-            echo "Generated Dockerfile:"
-            cat Dockerfile.build
+            echo "Processing destination tag: $dest_tag (source: $source_tag)"
 
-            # Build and push the image
-            docker buildx build \
-              --platform linux/amd64,linux/arm64 \
-              --file Dockerfile.build \
-              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag \
-              --push \
-              .
+            # Check if we've already built this source image
+            if [ -n "${BUILT_IMAGES[$source_tag]:-}" ]; then
+              echo "Reusing existing image for $source_tag, just tagging as $dest_tag"
 
-            # Clean up
-            rm Dockerfile.build
+              # Tag the existing image
+              docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$source_tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
+              docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
+            else
+              echo "Building new image for source tag: $source_tag"
 
-            echo "Successfully built and pushed ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag"
+              # Create Dockerfile from template
+              sed "s/{{TAG}}/$source_tag/g" Dockerfile.template > Dockerfile.build
+
+              echo "Generated Dockerfile:"
+              cat Dockerfile.build
+
+              # Create cache key based on source tag
+              CACHE_KEY="wordpress-apache-$source_tag"
+
+              # Build and push the image with GitHub Actions cache
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                --file Dockerfile.build \
+                --cache-from type=gha,scope=$CACHE_KEY \
+                --cache-to type=gha,mode=max,scope=$CACHE_KEY \
+                --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$source_tag \
+                --push \
+                .
+
+              # Mark this source as built
+              BUILT_IMAGES[$source_tag]=1
+
+              # If destination tag is different from source, tag and push it too
+              if [ "$dest_tag" != "$source_tag" ]; then
+                echo "Tagging $source_tag as $dest_tag"
+                docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$source_tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
+                docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$dest_tag
+              fi
+
+              # Clean up
+              rm Dockerfile.build
+            fi
+
+            echo "Successfully processed $dest_tag"
           fi
         done
 
@@ -184,7 +285,13 @@ jobs:
       run: |
         set -euo pipefail
 
+        # Find the most recent version tag for latest
         LATEST_TAG=$(echo "${{ steps.get-tags.outputs.apache-tags }}" | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?.*apache' | sort -V | tail -1 || echo "")
+
+        # If no specific version found, try to find 6-apache
+        if [ -z "$LATEST_TAG" ]; then
+          LATEST_TAG=$(echo "${{ steps.get-tags.outputs.apache-tags }}" | grep '^6-apache$' || echo "")
+        fi
 
         if [ -n "$LATEST_TAG" ]; then
           echo "Tagging $LATEST_TAG as latest"
@@ -202,6 +309,7 @@ jobs:
         echo "- **Registry**: ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Image**: ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Minimum Version**: ${{ env.MIN_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Caching**: GitHub Actions cache enabled with buildx" >> $GITHUB_STEP_SUMMARY
 
         NEW_TAGS="${{ steps.check-existing.outputs.new-tags || '' }}"
         if [ -n "$NEW_TAGS" ]; then
@@ -211,7 +319,13 @@ jobs:
         fi
 
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "All available tags (>= ${{ env.MIN_VERSION }}):" >> $GITHUB_STEP_SUMMARY
+        echo "### Tag Mapping" >> $GITHUB_STEP_SUMMARY
+        echo '```json&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
+        echo &#x27;${{ steps.get-tags.outputs.tag-mapping }}&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
+        echo &#x27;```' >> $GITHUB_STEP_SUMMARY
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### All available tags (>= ${{ env.MIN_VERSION }}):" >> $GITHUB_STEP_SUMMARY
         echo '```&#x27; &gt;&gt; $GITHUB_STEP_SUMMARY
         echo &quot;${{ steps.get-tags.outputs.apache-tags }}&quot; &gt;&gt; $GITHUB_STEP_SUMMARY
         echo &#x27;```' >> $GITHUB_STEP_SUMMARY
